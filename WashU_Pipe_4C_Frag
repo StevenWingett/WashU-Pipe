@@ -1,0 +1,357 @@
+#!/usr/bin/perl
+
+###################################################################################
+###################################################################################
+##This file is Copyright (C) 2015, Steven Wingett (steven.wingett@babraham.ac.uk)##
+##                                                                               ##
+##                                                                               ##
+##This file is part of WashU_Pipe.                                               ##
+##                                                                               ##
+##WashU_Pipe is free software: you can redistribute it and/or modify             ##
+##it under the terms of the GNU General Public License as published by           ##
+##the Free Software Foundation, either version 3 of the License, or              ##
+##(at your option) any later version.                                            ##
+##                                                                               ##
+##WashU_Pipe is distributed in the hope that it will be useful,                  ##
+##but WITHOUT ANY WARRANTY; without even the implied warranty of                 ##
+##MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the                  ##
+##GNU General Public License for more details.                                   ##
+##                                                                               ##
+##You should have received a copy of the GNU General Public License              ##
+##along with WashU_Pipe.  If not, see <http://www.gnu.org/licenses/>.            ##
+###################################################################################
+###################################################################################
+
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX;
+use FindBin '$Bin';
+use lib $Bin;
+use WashU_Pipe_Module;
+
+use Data::Dumper;
+
+
+#######################################################################
+#Get and check user input
+#Option variables
+my $columns;
+my $combine;
+my $digest;
+my $filelist;
+my $fragments_file;
+my $help;
+my $merge;
+my $minimum = 0;
+my $maximum = 0;
+my $version;
+
+my $config_result = GetOptions(
+    "combine" => \$combine,
+	"columns=s" => \$columns,
+	"digest=s" => \$digest,
+	"filelist=s" => \$filelist,
+    "fragments=s" => \$fragments_file,    #Fragments of interest
+	"merge=i" => \$merge,
+    "help" => \$help,
+    "maximum=i" => \$maximum,
+    "minimum=i" => \$minimum,
+    "version" => \$version
+);
+
+die "Could not parse options" unless ($config_result);
+
+if ($help) {
+    print while (<DATA>);
+    exit(0);
+}
+
+if($version){
+    $version = get_version();
+    print "WashU_Pipe v$version\n";
+    exit(0);
+}
+
+$minimum = abs($minimum);    #In case user specified a negative value
+$maximum = abs($maximum); 
+
+if($maximum and $minimum){
+    unless($maximum > $minimum){
+        die "--maximum $maximum needs to be greater than --minimum $minimum\n";
+    }
+}
+
+unless ( defined $fragments_file ) {
+    die "Specify the --fragments file of interest.\n";
+}
+
+if(defined $columns){
+	unless($columns =~ /^\d+,\d+,\d+,\d+$/){
+		die "The --columns parameter needs to be a list of four comma-separated integers e.g. 2,4,5,6\n"; 
+	}
+}else{
+	$columns = '1,2,3,4';
+}
+
+if($merge){
+	$merge = abs($merge);
+	die "Please specify --digest file, since --merge option specified.\n" unless(defined $digest);
+}else{
+	$merge = 1;
+}
+
+my @files;
+push(@files, getFilenames($filelist)) if defined $filelist;
+push (@files, @ARGV) if @ARGV;
+@files = deduplicate_array(@files);
+
+die "Please specify files to process.\n" unless (@files);
+
+
+
+
+##########################################################################################
+#Read digest file, if required
+my %merged_frag_conversion;    #%{fragment} = merged_fragment  (i.e. csome \t start \t end)
+if(defined $digest){
+
+	my %digest_frags;    #%{chromosome_name} -> @"start\tend"
+ 
+	if ( $digest =~ /.*\.gz$/ ) {
+        open( DIGEST, "zcat $digest |" ) or die "Cannot open digest file '$digest': $!";
+	} else {
+        open( DIGEST, $digest ) or die "Cannot open digest file '$digest': $!";
+    }
+
+	scalar <DIGEST>;    #First line
+	scalar <DIGEST>;    #Second line
+
+	while (<DIGEST>) {
+		my $line = $_;
+		chomp $line;
+		my ($csome, $start, $end) = split(/\t/, $line);		
+		
+		push( @{ $digest_frags{$csome} }, "$start\t$end");
+	}
+
+	#print Dumper \%digest_frags;
+	
+
+	foreach my $csome (keys %digest_frags){
+		my $i = 1;
+		my $array_size = scalar ( @{ $digest_frags{$csome} } );
+		foreach my $frag_borders ( @{ $digest_frags{$csome} } ){
+				my ($frag_start, $frag_end) = split (/\t/, $frag_borders);
+				
+				my $start_array_index = ($merge * (floor( ($i - 1) / $merge) ));
+				my $end_array_index = $start_array_index + $merge - 1;
+				$end_array_index = ($array_size - 1) if($end_array_index >= $array_size);    #Don't go beyond end of chromosome
+				
+				my $merged_start = ${ $digest_frags{$csome} }[$start_array_index];
+				$merged_start = (split(/\t/, $merged_start))[0];
+				my $merged_end = ${ $digest_frags{$csome} }[$end_array_index];
+				$merged_end = (split(/\t/, $merged_end))[1];
+						
+				$merged_frag_conversion{"$csome\t$frag_start\t$frag_end"} = "$csome\t$merged_start\t$merged_end";
+				$i++;
+		}		
+	}
+	
+	#print Dumper \%merged_frag_conversion;
+}
+
+#########################################################################################
+#Determine the bait positions
+print "Identifying other ends using fragment baits in $fragments_file\n";
+
+#Read in the promoter file and store the position as a key and the promoter name as a value
+my ($csome_col, $start_col, $end_col, $fragment_col) = split(/,/, $columns);    #Determine what each column contains
+my %fragments;    #%fragments{genomic location} = @(names)
+my $ids_ok = 1;
+open( FRAGMENTS, '<', $fragments_file ) or die "Could not open $fragments_file : $!";
+while (<FRAGMENTS>) {
+    chomp;
+    my $line = $_;
+	next if $line =~ /^\s*$/;    #Ignore empty lines
+	
+	my $csome = (split(/\t/, $line))[$csome_col - 1];
+    my $start = (split(/\t/, $line))[$start_col - 1];
+	my $end = (split(/\t/, $line))[$end_col - 1];
+	my $fragment = (split(/\t/, $line))[$fragment_col - 1];
+		
+	$fragment = 'Combined' if $combine;    #Combining output into 1 file
+	$fragment = seqmonk_reformatter($fragment);    #Rename
+    my $position = "$csome\t$start\t$end";
+
+	unless ($fragment =~ /^[\w\.\-\|]+$/){
+		warn "'$fragment' contains non-alphanumeric characters (underscore, full-stop, hyphen and pipe are ok)\n"; 
+		$ids_ok = 0;
+	}
+    $fragment = seqmonk_reformatter($fragment);    #Format the fragment name (which may be in Seqmonk format) - split at pipe and keep everything before the last hyphen
+    push @{ $fragments{$position} }, $fragment;
+}
+close FRAGMENTS;
+die "Edit the 4C probes file '$fragments_file' accordingly\n" unless($ids_ok);
+
+#Create a reciprocal hash/arrays of fragment_id_positions
+my %fragment_id_positions;
+foreach my $fragment ( keys %fragments ) {
+    foreach my $id ( @{ $fragments{$fragment} } ) {
+        push( @{ $fragment_id_positions{$id} }, $fragment );
+    }
+}
+
+
+
+
+########################################################################################
+#Process the HiCUP BED files sequentially
+foreach my $interactions_file (@files) {
+    open( INTERACTIONS, '<', $interactions_file ) or die "Could not open $interactions_file : $!";
+    print "Processing $interactions_file\n";
+
+    my %other_ends;    #    %other-ends{id} = data
+
+    while (<INTERACTIONS>) {
+        my @lines_1_and_2;
+        $lines_1_and_2[0] = $_;
+        $lines_1_and_2[1] = scalar <INTERACTIONS>;
+		chomp $lines_1_and_2[0];
+		chomp $lines_1_and_2[1];
+				 
+        if($minimum or $maximum){    #Only include di-tags separated by a minimum distance
+			my ($csomeF, $startF, $endF) = split(/\t/, $lines_1_and_2[0]);
+			my ($csomeR, $startR, $endR) = split(/\t/, $lines_1_and_2[1]);
+					
+            next if($csomeF ne $csomeR);    #Trans di-tag
+			
+			my $distance;
+            if($endF > $endR){    #Reverse read first    
+                 $distance = $startF - $endR - 1;
+            }else{    #Forward read first
+			     $distance = $startR - $endF - 1;
+            }
+						
+            next if($distance < $minimum);
+			next if( ($distance > $maximum) and $maximum );   #Check $maximum set by user (i.e is not default: 0)
+        }
+				
+        my %id_no_duplicates;
+        foreach my $line (@lines_1_and_2) {
+            my ( $csome, $start, $end, $score ) = split( /\t/, $line );
+            my $position = "$csome\t$start\t$end";
+
+
+            if ( exists $fragments{$position} ) {
+                foreach my $id ( @{ $fragments{$position} } ) {
+                    $id_no_duplicates{$id} = '';
+                }
+            }
+        }
+		
+		foreach my $id ( keys %id_no_duplicates ) {
+			$other_ends{$id} .= $lines_1_and_2[0] . "\n" . $lines_1_and_2[1] . "\n";;
+        }
+    }
+
+    close INTERACTIONS or die "Could not close $interactions_file : $!";
+
+	
+    #Write the results output files
+    foreach my $id ( keys %other_ends ) {
+		open( OUT, '>', "$interactions_file.$id.otherends.txt" ) or die "Could not write to $interactions_file.$id.otherends.txt : $!";
+        if(defined $digest){    #Using the digest input file
+			my ($other_end_to_lookup1, $other_end_to_lookup2) = split(/\n/, $other_ends{$id});
+			if(exists $merged_frag_conversion{$other_end_to_lookup1} and exists $merged_frag_conversion{$other_end_to_lookup2} ){
+				print OUT "$merged_frag_conversion{$other_end_to_lookup1}\n$merged_frag_conversion{$other_end_to_lookup2}\n";
+			}else{
+				die "Could not find '$other_end_to_lookup1' and/or '$other_end_to_lookup2' in digest file '$digest'\n";
+			}
+		}else{
+			print OUT $other_ends{$id};
+		}
+        close OUT or die "Could not close $interactions_file.$id.otherends.txt : $!";
+	}
+}
+
+print "Processing complete\n";
+
+exit (0);
+
+
+__DATA__
+
+WashU_Pipe_4C_Frag
+
+SYNOPSIS
+
+To identify captured Hi-C di-tags
+
+FUNCTION
+
+WashU_Pipe_4C_Frag --fragments [Fragments File] [Options] [BED files]
+WashU_Pipe_4C_Frag --fragments [Fragments File] --filelist [File listing BED files] [Options]
+WashU_Pipe_4C_Frag --fragments [Fragments File] --filelist [File listing BED files] [Options] [BED files]
+
+
+Takes BED files and a list of captured fragments and writes to separate outputfiles
+(1 file per bait) the captured interacting fragments (in BED format).
+
+BED format is tab-delimited, with paired interacting fragments on adjacent lines:
+Chromosome     Start     End     Extra_Optional_Columns
+
+The capture file file should be a tab-delimited list of positions:
+Chromosome     Start     End     Bait_ID
+
+Please only name bait IDs using alphanumeric characters and/or underscores.
+
+The script also attempts to intelligently process bait ids in SeqMonk format and converts to a more
+concise id:
+e.g. Hcfc1-001|Hcfc1-002|Hcfc1-005 is abbreviated to Hcfc
+
+Each output filename will include the bait ID (unless the --combine option is selected, in which
+case the filename will have will be named *.Combined.*).    
+
+PLEASE NOTE:
+The bait fragments should correspond EXACTLY (in terms of chromsome name and start/end positions) to
+captured fragments expected in the input BED file. Unless there is an exact match, a fragment
+will not considered to be captured.  
+
+COMMAND LINE OPTIONS
+
+--combine           Writes all captured fragment pairs to the same output file, irrespective of the
+                    capture region to which the di-tag maps. (Different sample input BED 
+                    files will still generate separate outputfiles.)
+					
+--columns           The column order for the baits file may be specified using a comma-
+                    separated list of integers e.g. --columns 3,5,1,2 indicates that the
+                    Chromosome is in column 3; Start in column 5; End in column 1
+                    and Bait_ID in column 2. (This is a 1-based numbering system.)
+                    Default: 1,2,3,4 (i.e 1:Chromosome; 2:Start; 3:End; 4:Bait_ID)
+
+--digest            Specifies a HiCUP digest file. With this option selected, all input fragment 
+                    must correspond exactly to the fragments specified in the HiCUP digest file 
+                   (also see --merge)					
+					
+--filelist          Name of file listing BED files to process
+
+--fragments         Tab-delimited list of capture (bait) fragments and IDs
+
+--maximum           Takes an integer of the maximum number of base pairs allowed between a di-tag
+                    read pair and filters out reads further away than this distance (as well as
+                    trans di-tags)
+					
+--merge             To be used with the --digest option, specifes the number of fragments to merge
+                    so the start and end positions of the output fragments correspond to merged
+                    fragments
+					
+--minimum           Takes an integer of the minimum number of base pairs allowed between a di-tag
+                    read pair and filters out reads closer than this distance (as well as trans 
+                    di-tags) 
+					
+--help              Print help message and exit
+
+--version           Print the program version and exit
+
+Steven Wingett, Babraham Institute, Cambridge, UK (steven.wingett@babraham.ac.uk)

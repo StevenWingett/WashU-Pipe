@@ -1,0 +1,146 @@
+#!/usr/bin/perl
+
+###################################################################################
+###################################################################################
+##This file is Copyright (C) 2015, Steven Wingett (steven.wingett@babraham.ac.uk)##
+##                                                                               ##
+##                                                                               ##
+##This file is part of WashU_Pipe.                                               ##
+##                                                                               ##
+##WashU_Pipe is free software: you can redistribute it and/or modify             ##
+##it under the terms of the GNU General Public License as published by           ##
+##the Free Software Foundation, either version 3 of the License, or              ##
+##(at your option) any later version.                                            ##
+##                                                                               ##
+##WashU_Pipe is distributed in the hope that it will be useful,                  ##
+##but WITHOUT ANY WARRANTY; without even the implied warranty of                 ##
+##MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the                  ##
+##GNU General Public License for more details.                                   ##
+##                                                                               ##
+##You should have received a copy of the GNU General Public License              ##
+##along with WashU_Pipe.  If not, see <http://www.gnu.org/licenses/>.            ##
+###################################################################################
+###################################################################################
+
+use strict;
+use warnings;
+use Getopt::Long;
+use FindBin '$Bin';
+use lib $Bin;
+use WashU_Pipe_Module;
+
+use Data::Dumper;
+
+#Option variables
+my $baits_file;
+my $count;
+my $digest;
+my $window;
+my $washu_format;
+my $filelist;
+my $ftp;
+my $help;
+my $email;
+my $version;
+
+my $config_result = GetOptions(
+"4c=s"     => \$baits_file,
+"count"    => \$count,
+"digest=s" => \$digest,
+"washu" => \$washu_format,
+"filelist" => \$filelist,
+"ftp=s"    => \$ftp,
+"window=i" => \$window,
+"help"     => \$help,
+"version" => \$version,
+"email=s"	=> \$email
+);
+die "Could not parse options" unless ($config_result);
+
+if (defined $help) {
+    print_help();
+	exit (0);
+}else{
+	$help = '';
+}
+
+if($version){
+	$version = get_version();
+	print "WashU_Pipe v$version\n";
+	exit(0);
+}
+
+#Process arguments
+if(defined $email){
+	$email = "-m eas -M $email";
+}else{
+	$email = '';
+}
+
+if(defined $baits_file){
+	$baits_file = "--4c $baits_file";
+}else{
+	$baits_file = '';
+}
+
+if(defined $count){
+	$count = "--count $count";
+}else{
+	$count = '';
+}
+
+if(defined $digest){
+	$digest = "--digest $digest";
+}else{
+	$digest = '';
+}
+
+if(defined $filelist){
+	$filelist = "--filelist $filelist";
+}else{
+	$filelist= '';
+}
+
+if(defined $ftp){
+	$ftp = "--ftp $ftp";
+}else{
+	$ftp = '';
+}
+
+if(defined $window){
+	$window = "--window $window";
+}else{
+	$window = '';
+}
+
+if(defined $washu_format){
+	$washu_format = '--washu';
+}else{
+	$washu_format = '';
+}
+
+if(-e 'washu_filename_list_temp_file.txt'){
+	die "Temporary file 'washu_filename_list_temp_file.txt' already exists, please delete.\n";
+}
+
+if( (scalar @ARGV == 0) and !defined $filelist){
+	die "Please specify file(s) to process\n";
+}
+
+check_modules();
+
+my $filename_string = join (' ', @ARGV);
+
+#Send job to cluster
+print "Sending request to cluster\n";
+
+!system("echo \"$Bin/WashU_Pipe $baits_file $count $digest $window $washu_format $filelist $ftp $help $filename_string\" | qsub -cwd -V -l vf=2G -pe orte 1 -o WashU_Cluster.out -j y -N WashU_Cluster $email") or die "Could not send job to cluster : $! ";
+
+exit (0);
+
+
+
+
+
+
+

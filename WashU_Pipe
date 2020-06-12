@@ -1,0 +1,389 @@
+#!/usr/bin/perl
+
+###################################################################################
+###################################################################################
+##This file is Copyright (C) 2015, Steven Wingett (steven.wingett@babraham.ac.uk)##
+##                                                                               ##
+##This file is part of WashU_Pipe.                                               ##
+##                                                                               ##
+##WashU_Pipe is free software: you can redistribute it and/or modify             ##
+##it under the terms of the GNU General Public License as published by           ##
+##the Free Software Foundation, either version 3 of the License, or              ##
+##(at your option) any later version.                                            ##
+##                                                                               ##
+##WashU_Pipe is distributed in the hope that it will be useful,                  ##
+##but WITHOUT ANY WARRANTY; without even the implied warranty of                 ##
+##MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the                  ##
+##GNU General Public License for more details.                                   ##
+##                                                                               ##
+##You should have received a copy of the GNU General Public License              ##
+##along with WashU_Pipe.  If not, see <http://www.gnu.org/licenses/>.            ##
+###################################################################################
+###################################################################################
+
+use strict;
+use warnings;
+use Getopt::Long;
+use FindBin '$Bin';
+use lib $Bin;
+use WashU_Pipe_Module;
+
+use Data::Dumper;
+
+#Option variables
+my $baits_file;
+my $count;
+my $columns = '';
+my $combine = '';
+my $digest;
+my $merge;
+my $minimum = 0;
+my $maximum = 0;
+my $window;
+my $washu_format;
+my $filelist;
+my $ftp;
+my $version;
+my $help;
+
+my $config_result = GetOptions(
+    "4C=s"     => \$baits_file,
+    "columns=s" => \$columns,
+    "combine" => \$combine,
+    "count"    => \$count,
+    "digest=s" => \$digest,
+	"filelist=s" => \$filelist,
+    "ftp=s"    => \$ftp,
+    "merge=i" => \$merge,
+    "maximum=i" => \$maximum,
+    "minimum=i" => \$minimum,
+    "washu"    => \$washu_format,
+    "window=i" => \$window,
+    "version"  => \$version,
+    "help"     => \$help
+);
+die "Could not parse options.\n" unless ($config_result);
+
+#Check arguments ok
+if ($help) {
+    print_help();
+    exit(0);
+}
+
+if ($version) {
+    $version = get_version();
+    print "WashU_Pipe v$version\n";
+    exit(0);
+}
+
+my $bam_sam = 0;                          #Flag that checks whether the input file are in BAM/SAM files
+
+my @files;
+push(@files, getFilenames($filelist)) if defined $filelist;
+push (@files, @ARGV) if @ARGV;
+@files = deduplicate_array(@files);
+die "Please specify files to process.\n" unless (@files);
+
+foreach my $file (@files) {
+    unless ( -e $file ) {
+		die "File '$file' does not exist.\n";
+    }
+
+    if ( $file =~ /(\.sam|\.bam)$/ ) {
+        $bam_sam = 1;
+
+    } else {
+        if ($bam_sam) {
+            die "Input files need to be EITHER i) BAM/SAM files OR ii) interacting fragment files.\n";
+        }
+    }
+}
+
+if ($bam_sam) {
+    unless ( defined $digest or defined $window ) {
+        die "Please specify EITHER i) a digest file (--digest) or ii) a window size (--window) for BAM/SAM files.\n";
+    }
+}
+
+if ( defined $digest ) {
+    unless ( -e $digest ) {
+        die "Digest file '$digest' does not exist.\n";
+    }
+}
+
+if ( defined $digest and defined $window ) {
+    die "Please only specify a digest file (--digest) or a window size (--window).\n";
+}
+
+if(defined $merge){
+    die "Option --merge may only be specified in conjuction with the --digest option.\n" unless(defined $digest);
+    die "--merge 0 is not a valid option, please choose an integer greater than 1.\n" if ($merge == 0);
+    warn "--merge was set to '1', that will keep the fragment positions unaltered.\n" if ($merge == 1);
+    $merge = abs($merge);    #Prevent negative values
+}
+
+if ($washu_format) {
+    if ($bam_sam) {
+        die "Option '--washu' may not be selected when processing BAM/SAM file(s).\n";
+    }
+
+    if ( defined $digest ) {
+        die "The options '--digest' and '--washu' are mutually exclusive.\n";
+    }
+
+    if ( defined $window ) {
+        die "The options '--window' and '--washu' are mutually exclusive.\n";
+    }
+}
+
+if ( defined $ftp ) {
+    my @ftp_arguments = split( /,/, $ftp );
+    unless ( scalar(@ftp_arguments) == 3 ) {
+        die "Argument --ftp requires 3 arguments in a comma-separated list: '--ftp [Domain], [Username], [Password]'.\n";
+    }
+}
+
+if(-e 'washu_filename_list_temp_file.txt'){
+	die "Temporary file 'washu_filename_list_temp_file.txt' already exists, please delete.\n";
+}
+
+$minimum = abs($minimum);    #In case user specified a negative value
+$maximum = abs($maximum); 
+
+if($maximum and $minimum){
+    unless($maximum > $minimum){
+        die "--maximum $maximum needs to be greater than --minimum $minimum\n";
+    }
+}
+
+$combine = '--combine' if($combine ne '');
+$columns = "--columns $columns" if ($columns ne '');
+
+#Check relevant modules installed
+check_modules();
+
+
+#Makes sure input files (if not BAM/SAM format) do not have DOS or Mac line endings
+unless ($bam_sam) {
+    foreach my $file (@files) {
+        unless ( $file =~ /\.gz$/ ) {    #Do not process zipped files
+            !system("dos2unix $file") or die "Could not perform dos2unix conversion on $file.\n";
+            !system("mac2unix $file") or die "Could not perform mac2unix conversion on $file.\n";
+        }
+    }
+}
+
+print "Starting WashU_Pipe\n";
+
+#Create a merged Digest file - if required
+if(defined $merge){
+    print "Creating a merged digest file\n";
+    my $command = "$Bin/WashU_Merge_Digest_Fragments --merge $merge $digest";
+    !system($command) or die "Can't run '$command'\n";
+    $digest = "merged.$merge.$digest";    #Use this digest file instead
+}
+
+
+create_filename_list_file(@files);
+
+my @new_filenames = @files;
+#Convert from WashU format, if required
+if ($washu_format) {
+	if ( (defined $baits_file) or (defined $digest) or ($minimum != 0) or ($maximum != 0) or (defined $window) ){ 
+	
+		!system("$Bin/WashU_Pipe_WashU2Frags --filelist washu_filename_list_temp_file.txt") or die "Can't run '$Bin/WashU_Pipe_WashU2Frags washu_filename_list_temp_file.txt'\n";
+		unlink('washu_filename_list_temp_file.txt') or die "Could not delete 'washu_filename_list_temp_file.txt' : $!";
+		
+		@new_filenames = ();
+		foreach my $file (@files) {
+			push(@new_filenames, "$file.fragments.txt");
+		}
+	}
+}
+
+#Perform virtual 4C if required
+if ( defined $baits_file ) {
+
+    !system("dos2unix $baits_file") or die "Could not perform dos2unix conversion on $baits_file\n";
+    !system("mac2unix $baits_file") or die "Could not perform mac2unix conversion on $baits_file\n";
+
+	create_filename_list_file(@new_filenames);
+	
+    if ($bam_sam) {
+        !system("$Bin/WashU_Pipe_4C_SAM --capture $baits_file --filelist washu_filename_list_temp_file.txt --maximum $maximum --minimum $minimum $combine $columns") or die "Can't run WashU_Pipe_4C_SAM\n";
+    } else {
+        !system("$Bin/WashU_Pipe_4C_Frag --fragments $baits_file --filelist washu_filename_list_temp_file.txt --maximum $maximum --minimum $minimum $combine $columns") or die "Can't run WashU_Pipe_4C_Frag\n";
+    }
+	unlink('washu_filename_list_temp_file.txt') or die "Could not delete 'washu_filename_list_temp_file.txt' : $!";
+	
+    #Determine the 'other ends' output file names
+    open( BAITS, '<', $baits_file ) or die "Could not open baits file $baits_file : $!";
+    my @bait_ids;
+    while (<BAITS>) {
+        chomp;
+        my ($id) = ( split /\t/ )[3];
+		$id = seqmonk_reformatter($id);    #Rename
+        push( @bait_ids, $id );
+    }
+    close BAITS or die "Could not close $baits_file : $!";
+
+	@new_filenames = ();
+    foreach my $file (@files) {
+
+        if($combine){
+           if ($bam_sam) {    #Filename(s) may end in .bam or .txt
+                if ( -e "$file.Combined.otherends.bam" ) {    #Files may not exist if no read read/fragment mapped to a sepcified bait
+                    push(@new_filenames, "$file.Combined.otherends.bam");
+                }
+            } elsif ($washu_format) {
+                if ( -e "$file.fragments.txt.Combined.otherends.txt" ) {
+                     push(@new_filenames, "$file.fragments.txt.Combined.otherends.txt");    #Files may not exist if no read read/fragment mapped to a sepcified bait
+                }
+            } else {
+                if ( -e "$file.Combined.otherends.txt" ) {
+                    push(@new_filenames, "$file.Combined.otherends.txt");                  #Files may not exist if no read read/fragment mapped to a sepcified bait
+                }
+            }
+
+        }else{
+
+            foreach my $id (@bait_ids) {
+                if ($bam_sam) {    #Filename(s) may end in .bam or .txt
+                    if ( -e "$file.$id.otherends.bam" ) {    #Files may not exist if no read read/fragment mapped to a sepcified bait
+                        push(@new_filenames, "$file.$id.otherends.bam");
+                    }
+                } elsif ($washu_format) {
+                    if ( -e "$file.fragments.txt.$id.otherends.txt" ) {
+                         push(@new_filenames, "$file.fragments.txt.$id.otherends.txt");    #Files may not exist if no read read/fragment mapped to a sepcified bait
+                    }
+                } else {
+                    if ( -e "$file.$id.otherends.txt" ) {
+    					push(@new_filenames, "$file.$id.otherends.txt");                  #Files may not exist if no read read/fragment mapped to a sepcified bait
+                    }
+                }
+            }
+    
+        }
+
+
+
+    }
+                                                          #Remove trailing space
+    if ( scalar (@new_filenames) == 0 ) {
+        die "No reads mapped to capture regions\n";
+    }
+	create_filename_list_file(@new_filenames);
+}
+
+#$filehandler{$id} = newbamopen( $id . '_' . $interactions_file . '_otherends.bam' )
+
+#Convert file to the WashU text format
+if ( defined $digest and defined $window ) {
+    die "Please only specify a digest file (--digest) or a window size (--window).\n";
+}
+
+
+
+
+if ( defined $digest ) {
+    !system("$Bin/WashU_Pipe_SAM2Frag -d $digest --filelist washu_filename_list_temp_file.txt") or die "Can't run WashU_Pipe_SAM2Frag : $!";
+	unlink('washu_filename_list_temp_file.txt') or die "Could not delete 'washu_filename_list_temp_file.txt' : $!";
+	
+    my @intermediate_files = @new_filenames;    #Output files from WashU_Pipe_SAM2FRAG
+    my @fragment_files;
+    foreach my $file (@intermediate_files) {
+        push( @fragment_files, "$file.rest.frags.txt" );
+    }
+    @new_filenames = @fragment_files;
+	create_filename_list_file(@new_filenames);
+    @fragment_files  = deduplicate_array(@fragment_files);      #May be duplicates in array if bait named multiple times in baits file
+
+    !system("$Bin/WashU_Pipe_Frag2WashU_Count --filelist washu_filename_list_temp_file.txt") or die "Can't run WashU_Pipe_Frag2WashU_Count : $!";
+    foreach my $fragment_file (@fragment_files) {
+        unlink $fragment_file or die "Could not delete intermediate fragment file '$fragment_file' : $!";    #Delete intermediate fragment file
+    }
+
+} elsif ( defined $window ) {
+    !system("$Bin/WashU_Pipe_SAM2WashU_bin -bin $window --filelist washu_filename_list_temp_file.txt") or die "Can't run WashU_Pipe_SAM2WashU_bin : $!";
+} elsif ( defined $count ) {
+    !system("$Bin/WashU_Pipe_Frag2WashU_Count --filelist washu_filename_list_temp_file.txt") or die "Can't run WashU_Pipe_Frag2WashU_Count : $!";
+} elsif (defined $washu_format) {    #Make copies of orignal files for processing
+	@new_filenames = ();
+	foreach my $file (@files){
+	
+		print "Copying '$file'\n";
+
+		if ( $file =~ /\.gz$/ ) {
+				open( IN, "zcat $file |" ) or die "Couldn't read file \'$file\' : $!";
+		} elsif ( $file =~ /\.bz2$/ ) {
+				open( IN, "bzcat $file |" ) or die "Couldn't read file \'$file\' : $!";
+		} else {
+				open( IN, $file ) or die "Couldn't read file \'$file\' : $!";
+		}
+
+		my $outfile = "$file.washu_format.txt";
+		push(@new_filenames, $file);
+			
+		open(OUT, '>', $outfile) or die "Could not open '$outfile' : $!";
+		
+		while(<IN>){
+			print OUT;
+		}
+		
+		close IN;	
+		close OUT or die "Could not close $outfile; : $!";
+	}
+	 
+}else{
+    !system("$Bin/WashU_Pipe_Frag2WashU --filelist washu_filename_list_temp_file.txt") or die "Can't run WashU_Pipe_Frag2WashU : $!";
+}
+
+unlink('washu_filename_list_temp_file.txt') or warn "Could not delete 'washu_filename_list_temp_file.txt' : $!";
+
+#Create bgzip and tabix index files
+my @files_to_process = @new_filenames;
+@files_to_process = deduplicate_array(@files_to_process);    #May be duplicates in array if bait named multiple times in baits file
+my @files4ftp;
+
+foreach my $file (@files_to_process) {
+    $file .= '.washu_format.txt';
+    !system("bedSort $file $file.sorted.bed")   or die "Could not bedSort $file : $!";
+    unlink $file                                or die "Could not delete intermediate file $file: $!";
+    !system("bgzip $file.sorted.bed")           or die "Could not bgzip $file.sorted.bed : $!";
+    !system("tabix -p bed $file.sorted.bed.gz") or die "Could not index with Tabix $file.sorted.bed.gz : $!";
+
+    #Shorten the output filenames
+    my $output_filename = "$file.sorted.bed.gz.tbi";
+    $output_filename =~ s/\.washu_format\.txt\.sorted\.bed\.gz\.tbi$/\.washU.gz\.tbi/;
+    !system("mv $file.sorted.bed.gz.tbi $output_filename") or die "Could not rename $file.sorted.bed.gz.tbi: $!";
+    push( @files4ftp, "mput $output_filename" );
+
+    $output_filename = "$file.sorted.bed.gz";
+    $output_filename =~ s/\.washu_format\.txt\.sorted\.bed\.gz$/\.washU.gz/;
+    !system("mv $file.sorted.bed.gz $output_filename") or die "Could not rename $file.sorted.bed.gz: $!";
+    push( @files4ftp, "mput $output_filename" );    #Includes FTP command 'mput'
+}
+
+#Upload to the FTP, if site specified
+if ( defined $ftp ) {
+    print "Uploading to FTP: $ftp\n";
+	 my ( $ftp_domain, $ftp_usr, $ftp_psswd ) = split( /,/, $ftp );
+	
+	#Create a list of file to upload to the FTP (first lines is an FTP commands)
+	my $command = 'open ftp://' . $ftp_usr . ':' . $ftp_psswd . '@' . $ftp_domain;
+	unshift (@files4ftp, $command);
+	create_filename_list_file(@files4ftp);
+	
+    !system("lftp -f washu_filename_list_temp_file.txt") or die "Can't upload files to the FTP '$ftp': $!";
+    print "Uploading complete\n";
+	unlink('washu_filename_list_temp_file.txt') or die "Could not delete 'washu_filename_list_temp_file.txt' : $!";
+}
+
+print "Wash_U pipe complete.\n";
+
+exit(0);
+
+
+
+
+
